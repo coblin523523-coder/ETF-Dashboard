@@ -1,0 +1,1603 @@
+name: 일별 ETF 구성종목 수집
+
+on:
+  schedule:
+    # 07:00 KST = 22:00 UTC 전날. KST 월~금에 돌리려면 UTC 일~목.
+    - cron: "0 22 * * 0-4"
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "과거 며칠까지 소급 수집할지 (영업일 기준)"
+        required: false
+        default: "5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 구성종목 수집
+        env:
+          # 저장소 Settings → Secrets and variables → Actions 에 등록하면 사용됩니다.
+          # 없으면 비로그인으로 시도합니다.
+          KRX_ID: ${{ secrets.KRX_ID }}
+          KRX_PW: ${{ secrets.KRX_PW }}
+          BACKFILL: ${{ github.event.inputs.backfill || '5' }}
+        run: python scripts/collect.py --backfill "$BACKFILL"
+        working-directory: ${{ github.workspace }}
+
+      - name: 대시보드 생성
+        run: python scripts/render.py
+
+      - name: 변경분 커밋
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data docs
+          if git diff --staged --quiet; then
+            echo "변경 없음 (휴장일이거나 데이터 동일)"
+          else
+            git commit -m "데이터 갱신 $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M KST')"
+            git push
+          fi
+
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>글로벌 AI ETF Top10 대시보드</title>
+<style>
+  :root {
+    --bg: #fafaf9; --card: #ffffff; --border: #e5e3dd; --text: #1a1a19;
+    --text-secondary: #6b6a64; --text-muted: #96958e; --accent: #2a78d6;
+    --up: #1baf7a; --down: #e34948; --in-bg: #e1f5ee; --in-text: #085041;
+    --out-bg: #fcebeb; --out-text: #791f1f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 2rem; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Pretendard, sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); font-size: 13px; margin: 0 0 24px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .metric { background: var(--card); border: 0.5px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .metric .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+  .metric .value { font-size: 22px; font-weight: 600; }
+  .card { background: var(--card); border: 0.5px solid var(--border); border-radius: 12px; padding: 1.25rem; margin-bottom: 20px; }
+  .card h2 { font-size: 15px; font-weight: 600; margin: 0 0 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--text-secondary); font-weight: 500; font-size: 12px;
+    padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .code { font-size: 11px; color: var(--text-muted); }
+  .up { color: var(--up); }
+  .down { color: var(--down); }
+  .pill { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 12px; margin: 3px 6px 3px 0; }
+  .pill.in { background: var(--in-bg); color: var(--in-text); }
+  .pill.out { background: var(--out-bg); color: var(--out-text); }
+  .muted { color: var(--text-muted); font-size: 13px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-bottom: 10px; font-size: 12px; color: var(--text-secondary); align-items: center; }
+  .legend span { display: flex; align-items: center; gap: 4px; }
+  .legend-item { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+  .legend-all { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none;
+    padding-right: 12px; border-right: 0.5px solid var(--border); font-weight: 600; color: var(--text); }
+  .legend-cb, #legendAll { cursor: pointer; }
+  .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .hist-row { padding: 10px 0; border-bottom: 0.5px solid var(--border); }
+  .hist-row:last-of-type { border-bottom: none; }
+  .hist-date { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .more-btn { margin-top: 10px; width: 100%; padding: 8px; border-radius: 8px;
+    border: 0.5px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 13px; cursor: pointer; }
+  .more-btn:hover { background: var(--card); }
+  .view-toggle { display: inline-flex; background: var(--bg); border: 0.5px solid var(--border);
+    border-radius: 8px; padding: 3px; gap: 2px; }
+  .view-toggle button { border: none; background: transparent; padding: 5px 12px; font-size: 12px;
+    border-radius: 6px; cursor: pointer; color: var(--text-secondary); font-family: inherit; }
+  .view-toggle button.active { background: var(--card); color: var(--text); font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+  .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 600px) { .summary-grid { grid-template-columns: 1fr; } }
+  .summary-grid h3 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+  .scroll-list { max-height: 320px; overflow-y: auto; border: 0.5px solid var(--border);
+    border-radius: 8px; padding: 4px 10px; }
+  .flat-row { display: flex; align-items: center; gap: 10px; font-size: 12px;
+    padding: 7px 0; border-bottom: 0.5px solid var(--border); }
+  .flat-row:last-child { border-bottom: none; }
+  .fr-date { color: var(--text-muted); width: 78px; flex-shrink: 0; }
+  .fr-name { flex: 1; }
+  .fr-weight { width: 56px; text-align: right; font-variant-numeric: tabular-nums; }
+  footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 24px; }
+
+  /* ETF 전환 탭 */
+  .etf-tabs { display: flex; gap: 6px; margin-bottom: 18px; overflow-x: auto; padding-bottom: 2px; }
+  .etf-tabs button { flex: 0 0 auto; border: 0.5px solid var(--border); background: var(--card);
+    color: var(--text-secondary); padding: 8px 14px; border-radius: 999px; font-size: 13px;
+    cursor: pointer; font-family: inherit; white-space: nowrap; }
+  .etf-tabs button.active { background: var(--accent); border-color: var(--accent);
+    color: #fff; font-weight: 600; }
+  .warn { background: #fff8e6; border: 0.5px solid #f0d089; color: #6b5312;
+    border-radius: 10px; padding: 10px 13px; font-size: 12.5px; margin-bottom: 18px; }
+  .empty-state { text-align: center; padding: 40px 16px; color: var(--text-secondary); font-size: 13px; }
+
+  /* 좁은 화면 */
+  @media (max-width: 600px) {
+    body { padding: 1rem 0.85rem 2rem; }
+    h1 { font-size: 17px; }
+    .metric .value { font-size: 19px; }
+    .card { padding: 1rem; }
+    table { font-size: 12.5px; }
+    td, th { padding: 7px 5px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="etf-tabs" id="etfTabs"></div>
+
+  <h1 id="title"></h1>
+  <p class="sub" id="subtitle"></p>
+
+  <div class="warn" id="basisWarn" style="display:none;"></div>
+
+  <div id="emptyState" class="empty-state" style="display:none;">
+    수집된 데이터가 아직 없습니다. 첫 수집이 성공하면 이 자리에 Top10이 나타납니다.
+  </div>
+
+  <div id="content">
+    <div class="metrics">
+      <div class="metric"><div class="label">기준일</div><div class="value" id="mDate"></div></div>
+      <div class="metric"><div class="label">편입</div><div class="value" id="mIn"></div></div>
+      <div class="metric"><div class="label">편출</div><div class="value" id="mOut"></div></div>
+      <div class="metric"><div class="label">수집일수</div><div class="value" id="mDays"></div></div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">구성종목 TOP 10 (기준일 <span id="top10DateLabel"></span>)</h2>
+        <select id="top10DateSelect" style="font-size:13px; padding:5px 8px; border-radius:8px; border:0.5px solid var(--border); background:var(--card); color:var(--text);"></select>
+      </div>
+      <table>
+        <thead><tr><th>순위</th><th>종목명</th><th style="text-align:right">비중</th><th style="text-align:right">전일대비</th></tr></thead>
+        <tbody id="top10Body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+        <h2 style="margin:0;">TOP10 편출입 히스토리 (최신순)</h2>
+        <div style="display:flex; gap:12px; font-size:11px; color:var(--text-secondary);">
+          <span style="display:flex; align-items:center; gap:4px;"><span class="sw" style="background:var(--up);"></span>편입</span>
+          <span style="display:flex; align-items:center; gap:4px;"><span class="sw" style="background:var(--down);"></span>편출</span>
+        </div>
+      </div>
+      <div id="historyBody"></div>
+      <div id="histMoreWrap"></div>
+    </div>
+
+    <div class="card">
+      <h2>누적 편입 · 편출 전체보기</h2>
+      <p class="muted" style="margin:-8px 0 14px;">쌩 신규 편입 = 전체 기간 중 TOP10에 처음 들어온 종목 (재편입 제외) · 전체 편출 = 전체 기간의 편출 이력 전부</p>
+      <div class="summary-grid">
+        <div>
+          <h3 id="brandNewTitle"></h3>
+          <div class="scroll-list" id="brandNewList"></div>
+        </div>
+        <div>
+          <h3 id="allExitsTitle"></h3>
+          <div class="scroll-list" id="allExitsList"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">시점별 TOP10 종목 비중 추이</h2>
+        <div class="view-toggle" id="viewToggle">
+          <button type="button" data-view="daily" class="active">일간</button>
+          <button type="button" data-view="weekly">주간</button>
+          <button type="button" data-view="monthly">월간</button>
+        </div>
+      </div>
+      <p class="muted" style="margin:2px 0 14px;">각 날짜에 실제로 TOP10에 있었던 구간만 표시 (TOP10에서 빠지면 선이 끊김) · 일간=최근 20영업일, 주간=매주 첫 영업일, 월간=매월 첫 영업일</p>
+      <div class="legend" id="trendLegend"></div>
+      <div style="position:relative; height:340px;">
+        <canvas id="trendChart" role="img" aria-label="선택한 기간 단위로 실제 TOP10에 포함되었던 구간만 표시한 종목 비중 추이 선 그래프"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <footer>KRX 공시 PDF 기준 자동 생성 · pykrx · 2026-08-18 12:57 KST</footer>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const ETFS = [{"ticker": "456600", "name": "TIMEFOLIO 글로벌AI인공지능액티브", "short": "TIMEFOLIO AI"}, {"ticker": "471040", "name": "KoAct 글로벌AI&로봇액티브", "short": "KoAct AI·로봇"}, {"ticker": "466950", "name": "TIGER 글로벌AI액티브", "short": "TIGER AI"}];
+const PAYLOADS = {"456600": null, "471040": null, "466950": null};
+const NAME_COLORS = {"456600": {}, "471040": {}, "466950": {}};
+const BASES = {"456600": "", "471040": "", "466950": ""};
+const GRAY = '#d3d1c7';
+const VISIBLE_HISTORY = 5;
+
+let currentTicker = ETFS[0].ticker;
+let currentView = 'daily';
+let trendChart = null;
+
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const el = (id) => document.getElementById(id);
+
+/* ---------- ETF 탭 ---------- */
+function buildTabs() {
+  el('etfTabs').innerHTML = ETFS.map(e =>
+    `<button type="button" data-ticker="${e.ticker}" class="${e.ticker === currentTicker ? 'active' : ''}">${esc(e.short)}</button>`
+  ).join('');
+  document.querySelectorAll('#etfTabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      currentTicker = btn.dataset.ticker;
+      document.querySelectorAll('#etfTabs button').forEach(b => b.classList.toggle('active', b === btn));
+      renderEtf();
+    });
+  });
+}
+
+/* ---------- TOP10 표 ---------- */
+function renderTop10(date) {
+  const p = PAYLOADS[currentTicker];
+  const rows = p.all_top10[date] || [];
+  el('top10DateLabel').textContent = date;
+  el('top10Body').innerHTML = rows.map(r => {
+    const cls = (r.chg_bp || 0) > 0 ? 'up' : ((r.chg_bp || 0) < 0 ? 'down' : '');
+    const chg = r.is_new ? '신규'
+      : (r.chg_bp !== null ? (r.chg_bp > 0 ? '+' : '') + r.chg_bp.toFixed(0) + 'bp' : '-');
+    return `<tr>
+      <td>${r.rank}</td>
+      <td>${esc(r.name)}<div class="code">${esc(r.code)}</div></td>
+      <td class="num">${r.weight.toFixed(2)}%</td>
+      <td class="num ${cls}">${chg}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* ---------- 편출입 히스토리 ---------- */
+function pills(items, cls) {
+  if (!items.length) return '<span class="muted">변동 없음</span>';
+  return items.map(it => `<span class="pill ${cls}">${esc(it.name)} (${it.weight.toFixed(2)}%)</span>`).join('');
+}
+
+function renderHistory() {
+  const p = PAYLOADS[currentTicker];
+  if (!p.history.length) {
+    el('historyBody').innerHTML = '<p class="muted">최근 변동 내역 없음</p>';
+    el('histMoreWrap').innerHTML = '';
+    return;
+  }
+  el('historyBody').innerHTML = p.history.map((h, i) => `
+    <div class="hist-row${i >= VISIBLE_HISTORY ? ' hidden-row' : ''}"${i >= VISIBLE_HISTORY ? ' style="display:none;"' : ''}>
+      <p class="hist-date">${h.date} <span class="muted">(${h.prev_date} 대비)</span></p>
+      <div style="margin-bottom:4px;">${pills(h.entries, 'in')}</div>
+      <div>${pills(h.exits, 'out')}</div>
+    </div>`).join('');
+
+  const remaining = Math.max(0, p.history.length - VISIBLE_HISTORY);
+  el('histMoreWrap').innerHTML = remaining > 0
+    ? `<button class="more-btn" id="histMoreBtn">더보기 (${remaining}건)</button>` : '';
+  if (remaining > 0) {
+    el('histMoreBtn').addEventListener('click', function () {
+      document.querySelectorAll('.hidden-row').forEach(x => x.style.display = 'block');
+      this.style.display = 'none';
+    });
+  }
+}
+
+/* ---------- 누적 편입·편출 ---------- */
+function flatRows(items, emptyMsg) {
+  if (!items.length) return `<p class="muted">${emptyMsg}</p>`;
+  return items.map(it => `
+    <div class="flat-row">
+      <span class="fr-date">${it.date}</span>
+      <span class="fr-name">${esc(it.name)}<span class="code" style="margin-left:6px;">${esc(it.code)}</span></span>
+      <span class="fr-weight">${it.weight.toFixed(2)}%</span>
+    </div>`).join('');
+}
+
+function renderCumulative() {
+  const p = PAYLOADS[currentTicker];
+  el('brandNewTitle').textContent = `쌩 신규 편입 (${p.brand_new_entries.length}건)`;
+  el('brandNewList').innerHTML = flatRows(p.brand_new_entries, '전체 기간 중 신규 편입 없음');
+  el('allExitsTitle').textContent = `전체 편출 (${p.all_exits_flat.length}건)`;
+  el('allExitsList').innerHTML = flatRows(p.all_exits_flat, '전체 기간 중 편출 없음');
+}
+
+/* ---------- 추이 차트 ---------- */
+function sortNamesAlpha(names) {
+  return names.slice().sort((a, b) => {
+    if (a === '현금' || a === '원화예금') return -1;
+    if (b === '현금' || b === '원화예금') return 1;
+    return a.localeCompare(b, 'ko');
+  });
+}
+
+function buildDatasets(view) {
+  const colors = NAME_COLORS[currentTicker];
+  const series = PAYLOADS[currentTicker].trend_views[view].series;
+  return sortNamesAlpha(Object.keys(series)).map(name => ({
+    label: name, data: series[name],
+    borderColor: colors[name] || GRAY, backgroundColor: colors[name] || GRAY,
+    spanGaps: false, tension: 0.25, pointRadius: 2, borderWidth: 2,
+  }));
+}
+
+function buildLegend(datasets) {
+  el('trendLegend').innerHTML =
+    '<label class="legend-all"><input type="checkbox" id="legendAll" checked> 전체</label>' +
+    datasets.map((d, i) =>
+      `<label class="legend-item" data-idx="${i}"><input type="checkbox" class="legend-cb" data-idx="${i}" checked><span class="sw" style="background:${d.borderColor}"></span>${esc(d.label)}</label>`
+    ).join('');
+
+  el('legendAll').addEventListener('change', (e) => {
+    document.querySelectorAll('.legend-cb').forEach(cb => { cb.checked = e.target.checked; });
+    applySelection();
+  });
+  document.querySelectorAll('.legend-cb').forEach(cb => cb.addEventListener('change', applySelection));
+  document.querySelectorAll('.legend-item').forEach(label => {
+    label.addEventListener('click', (e) => {
+      if (e.target.classList.contains('legend-cb')) return;
+      e.preventDefault();
+      const cb = label.querySelector('.legend-cb');
+      cb.checked = !cb.checked;
+      applySelection();
+    });
+  });
+}
+
+function applySelection() {
+  const colors = NAME_COLORS[currentTicker];
+  const checked = Array.from(document.querySelectorAll('.legend-cb')).map(cb => cb.checked);
+  trendChart.data.datasets.forEach((ds, i) => {
+    const on = checked[i];
+    const orig = colors[ds.label] || GRAY;
+    ds.borderColor = on ? orig : GRAY;
+    ds.backgroundColor = on ? orig : GRAY;
+    ds.order = on ? 0 : 1;
+  });
+  trendChart.update();
+  el('legendAll').checked = checked.every(c => c);
+}
+
+function renderView(view) {
+  currentView = view;
+  if (typeof Chart === 'undefined') {
+    // 차트 라이브러리를 못 불러온 경우(오프라인 등)에도 나머지 화면은 살아 있어야 한다.
+    el('trendLegend').innerHTML =
+      '<span class="muted">차트 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하세요.</span>';
+    return;
+  }
+  const datasets = buildDatasets(view);
+  const labels = PAYLOADS[currentTicker].trend_views[view].dates;
+  buildLegend(datasets);
+  if (trendChart) {
+    trendChart.data.labels = labels;
+    trendChart.data.datasets = datasets;
+    trendChart.update();
+    return;
+  }
+  trendChart = new Chart(el('trendChart'), {
+    type: 'line',
+    data: { labels: labels, datasets: datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { ticks: { callback: (v) => v + '%' } },
+                x: { ticks: { autoSkip: true, maxRotation: 45 } } },
+      interaction: { mode: 'index', intersect: false },
+      onClick: (evt, _e, chart) => {
+        const pts = chart.getElementsAtEventForMode(evt, 'index', { intersect: false }, true);
+        if (!pts.length) return;
+        const pos = Chart.helpers.getRelativePosition(evt, chart);
+        let bestIdx = null, bestDist = Infinity;
+        pts.forEach(p => {
+          const e2 = chart.getDatasetMeta(p.datasetIndex).data[p.index];
+          if (!e2 || e2.skip || typeof e2.y !== 'number' || isNaN(e2.y)) return;
+          const dist = Math.abs(e2.y - pos.y);
+          if (dist < bestDist) { bestDist = dist; bestIdx = p.datasetIndex; }
+        });
+        if (bestIdx === null) return;
+        const cb = document.querySelector(`.legend-cb[data-idx="${bestIdx}"]`);
+        if (cb) { cb.checked = !cb.checked; applySelection(); }
+      }
+    }
+  });
+}
+
+/* ---------- ETF 하나를 통째로 다시 그린다 ---------- */
+function renderEtf() {
+  const meta = ETFS.find(e => e.ticker === currentTicker);
+  const p = PAYLOADS[currentTicker];
+
+  el('title').textContent = `${meta.name} (${meta.ticker}) — Top10 대시보드`;
+
+  if (!p) {
+    el('subtitle').textContent = '수집된 데이터가 아직 없습니다';
+    el('content').style.display = 'none';
+    el('emptyState').style.display = 'block';
+    return;
+  }
+  el('content').style.display = '';
+  el('emptyState').style.display = 'none';
+
+  el('subtitle').textContent = p.prev_date
+    ? `기준일 ${p.latest_date} · 전일 ${p.prev_date} 대비`
+    : `기준일 ${p.latest_date} · 비교할 이전 영업일 없음`;
+
+  const basis = BASES[currentTicker];
+  el('basisWarn').style.display = (basis && basis !== 'KRX 제공 비중') ? 'block' : 'none';
+  el('basisWarn').innerHTML =
+    `⚠ 비중 산출 근거: <b>${esc(basis)}</b> — KRX가 이 ETF의 비중을 0으로 내려주어 대체 계산했습니다.`;
+
+  el('mDate').textContent = p.latest_date;
+  el('mIn').textContent = p.entries.length + '건';
+  el('mOut').textContent = p.exits.length + '건';
+  el('mDays').textContent = p.dates.length + '일';
+
+  const sel = el('top10DateSelect');
+  sel.innerHTML = p.dates.slice().reverse()
+    .map(d => `<option value="${d}"${d === p.latest_date ? ' selected' : ''}>${d}</option>`).join('');
+  renderTop10(p.latest_date);
+
+  renderHistory();
+  renderCumulative();
+
+  if (trendChart) { trendChart.destroy(); trendChart = null; }
+  renderView(currentView);
+}
+
+/* ---------- 초기화 ---------- */
+buildTabs();
+el('top10DateSelect').addEventListener('change', (e) => renderTop10(e.target.value));
+document.querySelectorAll('#viewToggle button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#viewToggle button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderView(btn.dataset.view);
+  });
+});
+renderEtf();
+</script>
+</body>
+</html>
+
+
+"""KRX 접속 없이 대시보드를 검증하기 위한 모의 데이터 생성기.
+
+    python scripts/make_mock.py
+
+data/ 에 가짜 CSV를 채워 넣고 render.py 를 돌리면 화면이 어떻게 보이는지 확인할 수 있다.
+실제 수집을 시작하기 전에 data/ 폴더를 비우면 된다.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+from config import DATA_DIR, ETFS
+
+random.seed(7)
+
+UNIVERSE = [
+    ("NVDA", "NVIDIA CORP"), ("MSFT", "MICROSOFT CORP"), ("AAPL", "APPLE INC"),
+    ("GOOGL", "ALPHABET INC-CL A"), ("AMZN", "AMAZON.COM INC"), ("META", "META PLATFORMS INC"),
+    ("AVGO", "BROADCOM INC"), ("TSM", "TAIWAN SEMICONDUCTOR"), ("AMD", "ADVANCED MICRO DEVICES"),
+    ("PLTR", "PALANTIR TECHNOLOGIES"), ("MU", "MICRON TECHNOLOGY"), ("ARM", "ARM HOLDINGS"),
+    ("CRM", "SALESFORCE INC"), ("ORCL", "ORACLE CORP"), ("VRT", "VERTIV HOLDINGS"),
+    ("005930", "삼성전자"), ("000660", "SK하이닉스"), ("042700", "한미반도체"),
+    ("SNOW", "SNOWFLAKE INC"), ("NOW", "SERVICENOW INC"), ("DELL", "DELL TECHNOLOGIES"),
+]
+
+
+def business_days(n: int) -> list[str]:
+    out, cur = [], datetime(2026, 8, 18)
+    while len(out) < n:
+        if cur.weekday() < 5:
+            out.append(cur.strftime("%Y%m%d"))
+        cur -= timedelta(days=1)
+    return sorted(out)
+
+
+def main() -> None:
+    dates = business_days(22)
+
+    for etf in ETFS:
+        ticker = etf["ticker"]
+        out_dir = DATA_DIR / ticker
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        pool = UNIVERSE.copy()
+        random.shuffle(pool)
+        holdings = pool[:16]
+        weights = {t: random.uniform(1.5, 9.0) for t, _ in holdings}
+        quotes = {}
+
+        for i, date in enumerate(dates):
+            # 비중을 조금씩 흔든다
+            for t in list(weights):
+                weights[t] = max(0.4, weights[t] * random.uniform(0.94, 1.06))
+
+            # 마지막 날에는 편입/편출을 하나씩 일으켜 diff 로직을 검증한다
+            if i == len(dates) - 1:
+                dropped = random.choice(list(weights))
+                del weights[dropped]
+                spare = [x for x in UNIVERSE if x[0] not in weights and x[0] != dropped]
+                if spare:
+                    new_t, _ = random.choice(spare)
+                    weights[new_t] = random.uniform(2.0, 5.5)
+
+            names = dict(UNIVERSE)
+            total = sum(weights.values())
+            rows = [
+                {
+                    "티커": t,
+                    "구성종목명": names[t],
+                    "계약수": round(random.uniform(50, 5000), 2),
+                    "금액": int(w / total * 1e10),
+                    "시가총액": int(w / total * 1.02e10),
+                    "비중": round(w / total * 96.5, 2),  # 나머지는 현금
+                }
+                for t, w in weights.items()
+            ]
+            rows.append({
+                "티커": "KRW", "구성종목명": "원화예금", "계약수": 0,
+                "금액": int(0.035 * 1e10), "시가총액": int(0.035 * 1e10), "비중": 3.5,
+            })
+            pd.DataFrame(rows).to_csv(out_dir / f"{date}.csv", index=False, encoding="utf-8-sig")
+            quotes[date] = {"종가": round(random.uniform(11000, 16000), 0), "NAV": 0, "거래량": 0}
+
+        (out_dir / "quotes.json").write_text(
+            json.dumps(quotes, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        print(f"  모의 데이터 생성: {etf['name']} ({ticker}) {len(dates)}일")
+
+
+if __name__ == "__main__":
+    main()
+
+"""payload 를 단일 HTML 대시보드로 렌더링한다 -> docs/index.html
+
+레이아웃·색·구성은 기존에 쓰던 top10_dashboard.html 형식을 그대로 따르고,
+ETF 3종을 상단 탭으로 전환할 수 있게 확장했다.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from config import DOCS_DIR, ETFS
+from payload import build_payload, load_records
+
+KST = ZoneInfo("Asia/Seoul")
+
+PALETTE = [
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7",
+    "#e34948", "#8a8a8a", "#7f77dd", "#0f6e56", "#993c1d", "#185fa5", "#c98500",
+    "#993556", "#27500a", "#3c3489", "#791f1f", "#5f5e5a", "#26215c",
+]
+
+CSS = """
+  :root {
+    --bg: #fafaf9; --card: #ffffff; --border: #e5e3dd; --text: #1a1a19;
+    --text-secondary: #6b6a64; --text-muted: #96958e; --accent: #2a78d6;
+    --up: #1baf7a; --down: #e34948; --in-bg: #e1f5ee; --in-text: #085041;
+    --out-bg: #fcebeb; --out-text: #791f1f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 2rem; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Pretendard, sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); font-size: 13px; margin: 0 0 24px; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .metric { background: var(--card); border: 0.5px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .metric .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+  .metric .value { font-size: 22px; font-weight: 600; }
+  .card { background: var(--card); border: 0.5px solid var(--border); border-radius: 12px; padding: 1.25rem; margin-bottom: 20px; }
+  .card h2 { font-size: 15px; font-weight: 600; margin: 0 0 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--text-secondary); font-weight: 500; font-size: 12px;
+    padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .code { font-size: 11px; color: var(--text-muted); }
+  .up { color: var(--up); }
+  .down { color: var(--down); }
+  .pill { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 12px; margin: 3px 6px 3px 0; }
+  .pill.in { background: var(--in-bg); color: var(--in-text); }
+  .pill.out { background: var(--out-bg); color: var(--out-text); }
+  .muted { color: var(--text-muted); font-size: 13px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-bottom: 10px; font-size: 12px; color: var(--text-secondary); align-items: center; }
+  .legend span { display: flex; align-items: center; gap: 4px; }
+  .legend-item { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
+  .legend-all { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none;
+    padding-right: 12px; border-right: 0.5px solid var(--border); font-weight: 600; color: var(--text); }
+  .legend-cb, #legendAll { cursor: pointer; }
+  .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .hist-row { padding: 10px 0; border-bottom: 0.5px solid var(--border); }
+  .hist-row:last-of-type { border-bottom: none; }
+  .hist-date { font-size: 13px; font-weight: 600; margin: 0 0 6px; }
+  .more-btn { margin-top: 10px; width: 100%; padding: 8px; border-radius: 8px;
+    border: 0.5px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: 13px; cursor: pointer; }
+  .more-btn:hover { background: var(--card); }
+  .view-toggle { display: inline-flex; background: var(--bg); border: 0.5px solid var(--border);
+    border-radius: 8px; padding: 3px; gap: 2px; }
+  .view-toggle button { border: none; background: transparent; padding: 5px 12px; font-size: 12px;
+    border-radius: 6px; cursor: pointer; color: var(--text-secondary); font-family: inherit; }
+  .view-toggle button.active { background: var(--card); color: var(--text); font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+  .summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 600px) { .summary-grid { grid-template-columns: 1fr; } }
+  .summary-grid h3 { font-size: 13px; font-weight: 600; margin: 0 0 8px; }
+  .scroll-list { max-height: 320px; overflow-y: auto; border: 0.5px solid var(--border);
+    border-radius: 8px; padding: 4px 10px; }
+  .flat-row { display: flex; align-items: center; gap: 10px; font-size: 12px;
+    padding: 7px 0; border-bottom: 0.5px solid var(--border); }
+  .flat-row:last-child { border-bottom: none; }
+  .fr-date { color: var(--text-muted); width: 78px; flex-shrink: 0; }
+  .fr-name { flex: 1; }
+  .fr-weight { width: 56px; text-align: right; font-variant-numeric: tabular-nums; }
+  footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 24px; }
+
+  /* ETF 전환 탭 */
+  .etf-tabs { display: flex; gap: 6px; margin-bottom: 18px; overflow-x: auto; padding-bottom: 2px; }
+  .etf-tabs button { flex: 0 0 auto; border: 0.5px solid var(--border); background: var(--card);
+    color: var(--text-secondary); padding: 8px 14px; border-radius: 999px; font-size: 13px;
+    cursor: pointer; font-family: inherit; white-space: nowrap; }
+  .etf-tabs button.active { background: var(--accent); border-color: var(--accent);
+    color: #fff; font-weight: 600; }
+  .warn { background: #fff8e6; border: 0.5px solid #f0d089; color: #6b5312;
+    border-radius: 10px; padding: 10px 13px; font-size: 12.5px; margin-bottom: 18px; }
+  .empty-state { text-align: center; padding: 40px 16px; color: var(--text-secondary); font-size: 13px; }
+
+  /* 좁은 화면 */
+  @media (max-width: 600px) {
+    body { padding: 1rem 0.85rem 2rem; }
+    h1 { font-size: 17px; }
+    .metric .value { font-size: 19px; }
+    .card { padding: 1rem; }
+    table { font-size: 12.5px; }
+    td, th { padding: 7px 5px; }
+  }
+"""
+
+JS_TEMPLATE = """
+const ETFS = __ETFS__;
+const PAYLOADS = __PAYLOADS__;
+const NAME_COLORS = __NAME_COLORS__;
+const BASES = __BASES__;
+const GRAY = '#d3d1c7';
+const VISIBLE_HISTORY = 5;
+
+let currentTicker = ETFS[0].ticker;
+let currentView = 'daily';
+let trendChart = null;
+
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const el = (id) => document.getElementById(id);
+
+/* ---------- ETF 탭 ---------- */
+function buildTabs() {
+  el('etfTabs').innerHTML = ETFS.map(e =>
+    `<button type="button" data-ticker="${e.ticker}" class="${e.ticker === currentTicker ? 'active' : ''}">${esc(e.short)}</button>`
+  ).join('');
+  document.querySelectorAll('#etfTabs button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      currentTicker = btn.dataset.ticker;
+      document.querySelectorAll('#etfTabs button').forEach(b => b.classList.toggle('active', b === btn));
+      renderEtf();
+    });
+  });
+}
+
+/* ---------- TOP10 표 ---------- */
+function renderTop10(date) {
+  const p = PAYLOADS[currentTicker];
+  const rows = p.all_top10[date] || [];
+  el('top10DateLabel').textContent = date;
+  el('top10Body').innerHTML = rows.map(r => {
+    const cls = (r.chg_bp || 0) > 0 ? 'up' : ((r.chg_bp || 0) < 0 ? 'down' : '');
+    const chg = r.is_new ? '신규'
+      : (r.chg_bp !== null ? (r.chg_bp > 0 ? '+' : '') + r.chg_bp.toFixed(0) + 'bp' : '-');
+    return `<tr>
+      <td>${r.rank}</td>
+      <td>${esc(r.name)}<div class="code">${esc(r.code)}</div></td>
+      <td class="num">${r.weight.toFixed(2)}%</td>
+      <td class="num ${cls}">${chg}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* ---------- 편출입 히스토리 ---------- */
+function pills(items, cls) {
+  if (!items.length) return '<span class="muted">변동 없음</span>';
+  return items.map(it => `<span class="pill ${cls}">${esc(it.name)} (${it.weight.toFixed(2)}%)</span>`).join('');
+}
+
+function renderHistory() {
+  const p = PAYLOADS[currentTicker];
+  if (!p.history.length) {
+    el('historyBody').innerHTML = '<p class="muted">최근 변동 내역 없음</p>';
+    el('histMoreWrap').innerHTML = '';
+    return;
+  }
+  el('historyBody').innerHTML = p.history.map((h, i) => `
+    <div class="hist-row${i >= VISIBLE_HISTORY ? ' hidden-row' : ''}"${i >= VISIBLE_HISTORY ? ' style="display:none;"' : ''}>
+      <p class="hist-date">${h.date} <span class="muted">(${h.prev_date} 대비)</span></p>
+      <div style="margin-bottom:4px;">${pills(h.entries, 'in')}</div>
+      <div>${pills(h.exits, 'out')}</div>
+    </div>`).join('');
+
+  const remaining = Math.max(0, p.history.length - VISIBLE_HISTORY);
+  el('histMoreWrap').innerHTML = remaining > 0
+    ? `<button class="more-btn" id="histMoreBtn">더보기 (${remaining}건)</button>` : '';
+  if (remaining > 0) {
+    el('histMoreBtn').addEventListener('click', function () {
+      document.querySelectorAll('.hidden-row').forEach(x => x.style.display = 'block');
+      this.style.display = 'none';
+    });
+  }
+}
+
+/* ---------- 누적 편입·편출 ---------- */
+function flatRows(items, emptyMsg) {
+  if (!items.length) return `<p class="muted">${emptyMsg}</p>`;
+  return items.map(it => `
+    <div class="flat-row">
+      <span class="fr-date">${it.date}</span>
+      <span class="fr-name">${esc(it.name)}<span class="code" style="margin-left:6px;">${esc(it.code)}</span></span>
+      <span class="fr-weight">${it.weight.toFixed(2)}%</span>
+    </div>`).join('');
+}
+
+function renderCumulative() {
+  const p = PAYLOADS[currentTicker];
+  el('brandNewTitle').textContent = `쌩 신규 편입 (${p.brand_new_entries.length}건)`;
+  el('brandNewList').innerHTML = flatRows(p.brand_new_entries, '전체 기간 중 신규 편입 없음');
+  el('allExitsTitle').textContent = `전체 편출 (${p.all_exits_flat.length}건)`;
+  el('allExitsList').innerHTML = flatRows(p.all_exits_flat, '전체 기간 중 편출 없음');
+}
+
+/* ---------- 추이 차트 ---------- */
+function sortNamesAlpha(names) {
+  return names.slice().sort((a, b) => {
+    if (a === '현금' || a === '원화예금') return -1;
+    if (b === '현금' || b === '원화예금') return 1;
+    return a.localeCompare(b, 'ko');
+  });
+}
+
+function buildDatasets(view) {
+  const colors = NAME_COLORS[currentTicker];
+  const series = PAYLOADS[currentTicker].trend_views[view].series;
+  return sortNamesAlpha(Object.keys(series)).map(name => ({
+    label: name, data: series[name],
+    borderColor: colors[name] || GRAY, backgroundColor: colors[name] || GRAY,
+    spanGaps: false, tension: 0.25, pointRadius: 2, borderWidth: 2,
+  }));
+}
+
+function buildLegend(datasets) {
+  el('trendLegend').innerHTML =
+    '<label class="legend-all"><input type="checkbox" id="legendAll" checked> 전체</label>' +
+    datasets.map((d, i) =>
+      `<label class="legend-item" data-idx="${i}"><input type="checkbox" class="legend-cb" data-idx="${i}" checked><span class="sw" style="background:${d.borderColor}"></span>${esc(d.label)}</label>`
+    ).join('');
+
+  el('legendAll').addEventListener('change', (e) => {
+    document.querySelectorAll('.legend-cb').forEach(cb => { cb.checked = e.target.checked; });
+    applySelection();
+  });
+  document.querySelectorAll('.legend-cb').forEach(cb => cb.addEventListener('change', applySelection));
+  document.querySelectorAll('.legend-item').forEach(label => {
+    label.addEventListener('click', (e) => {
+      if (e.target.classList.contains('legend-cb')) return;
+      e.preventDefault();
+      const cb = label.querySelector('.legend-cb');
+      cb.checked = !cb.checked;
+      applySelection();
+    });
+  });
+}
+
+function applySelection() {
+  const colors = NAME_COLORS[currentTicker];
+  const checked = Array.from(document.querySelectorAll('.legend-cb')).map(cb => cb.checked);
+  trendChart.data.datasets.forEach((ds, i) => {
+    const on = checked[i];
+    const orig = colors[ds.label] || GRAY;
+    ds.borderColor = on ? orig : GRAY;
+    ds.backgroundColor = on ? orig : GRAY;
+    ds.order = on ? 0 : 1;
+  });
+  trendChart.update();
+  el('legendAll').checked = checked.every(c => c);
+}
+
+function renderView(view) {
+  currentView = view;
+  if (typeof Chart === 'undefined') {
+    // 차트 라이브러리를 못 불러온 경우(오프라인 등)에도 나머지 화면은 살아 있어야 한다.
+    el('trendLegend').innerHTML =
+      '<span class="muted">차트 라이브러리를 불러오지 못했습니다. 인터넷 연결을 확인하세요.</span>';
+    return;
+  }
+  const datasets = buildDatasets(view);
+  const labels = PAYLOADS[currentTicker].trend_views[view].dates;
+  buildLegend(datasets);
+  if (trendChart) {
+    trendChart.data.labels = labels;
+    trendChart.data.datasets = datasets;
+    trendChart.update();
+    return;
+  }
+  trendChart = new Chart(el('trendChart'), {
+    type: 'line',
+    data: { labels: labels, datasets: datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { ticks: { callback: (v) => v + '%' } },
+                x: { ticks: { autoSkip: true, maxRotation: 45 } } },
+      interaction: { mode: 'index', intersect: false },
+      onClick: (evt, _e, chart) => {
+        const pts = chart.getElementsAtEventForMode(evt, 'index', { intersect: false }, true);
+        if (!pts.length) return;
+        const pos = Chart.helpers.getRelativePosition(evt, chart);
+        let bestIdx = null, bestDist = Infinity;
+        pts.forEach(p => {
+          const e2 = chart.getDatasetMeta(p.datasetIndex).data[p.index];
+          if (!e2 || e2.skip || typeof e2.y !== 'number' || isNaN(e2.y)) return;
+          const dist = Math.abs(e2.y - pos.y);
+          if (dist < bestDist) { bestDist = dist; bestIdx = p.datasetIndex; }
+        });
+        if (bestIdx === null) return;
+        const cb = document.querySelector(`.legend-cb[data-idx="${bestIdx}"]`);
+        if (cb) { cb.checked = !cb.checked; applySelection(); }
+      }
+    }
+  });
+}
+
+/* ---------- ETF 하나를 통째로 다시 그린다 ---------- */
+function renderEtf() {
+  const meta = ETFS.find(e => e.ticker === currentTicker);
+  const p = PAYLOADS[currentTicker];
+
+  el('title').textContent = `${meta.name} (${meta.ticker}) — Top10 대시보드`;
+
+  if (!p) {
+    el('subtitle').textContent = '수집된 데이터가 아직 없습니다';
+    el('content').style.display = 'none';
+    el('emptyState').style.display = 'block';
+    return;
+  }
+  el('content').style.display = '';
+  el('emptyState').style.display = 'none';
+
+  el('subtitle').textContent = p.prev_date
+    ? `기준일 ${p.latest_date} · 전일 ${p.prev_date} 대비`
+    : `기준일 ${p.latest_date} · 비교할 이전 영업일 없음`;
+
+  const basis = BASES[currentTicker];
+  el('basisWarn').style.display = (basis && basis !== 'KRX 제공 비중') ? 'block' : 'none';
+  el('basisWarn').innerHTML =
+    `⚠ 비중 산출 근거: <b>${esc(basis)}</b> — KRX가 이 ETF의 비중을 0으로 내려주어 대체 계산했습니다.`;
+
+  el('mDate').textContent = p.latest_date;
+  el('mIn').textContent = p.entries.length + '건';
+  el('mOut').textContent = p.exits.length + '건';
+  el('mDays').textContent = p.dates.length + '일';
+
+  const sel = el('top10DateSelect');
+  sel.innerHTML = p.dates.slice().reverse()
+    .map(d => `<option value="${d}"${d === p.latest_date ? ' selected' : ''}>${d}</option>`).join('');
+  renderTop10(p.latest_date);
+
+  renderHistory();
+  renderCumulative();
+
+  if (trendChart) { trendChart.destroy(); trendChart = null; }
+  renderView(currentView);
+}
+
+/* ---------- 초기화 ---------- */
+buildTabs();
+el('top10DateSelect').addEventListener('change', (e) => renderTop10(e.target.value));
+document.querySelectorAll('#viewToggle button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#viewToggle button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    renderView(btn.dataset.view);
+  });
+});
+renderEtf();
+"""
+
+
+def render(payloads: dict, bases: dict) -> str:
+    etf_meta = [{"ticker": e["ticker"], "name": e["name"], "short": e["short"]} for e in ETFS]
+
+    name_colors = {}
+    for e in ETFS:
+        p = payloads.get(e["ticker"])
+        order = p["name_order"] if p else []
+        name_colors[e["ticker"]] = {n: PALETTE[i % len(PALETTE)] for i, n in enumerate(order)}
+
+    js = (
+        JS_TEMPLATE
+        .replace("__ETFS__", json.dumps(etf_meta, ensure_ascii=False))
+        .replace("__PAYLOADS__", json.dumps(payloads, ensure_ascii=False))
+        .replace("__NAME_COLORS__", json.dumps(name_colors, ensure_ascii=False))
+        .replace("__BASES__", json.dumps(bases, ensure_ascii=False))
+    )
+    generated = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>글로벌 AI ETF Top10 대시보드</title>
+<style>{CSS}</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="etf-tabs" id="etfTabs"></div>
+
+  <h1 id="title"></h1>
+  <p class="sub" id="subtitle"></p>
+
+  <div class="warn" id="basisWarn" style="display:none;"></div>
+
+  <div id="emptyState" class="empty-state" style="display:none;">
+    수집된 데이터가 아직 없습니다. 첫 수집이 성공하면 이 자리에 Top10이 나타납니다.
+  </div>
+
+  <div id="content">
+    <div class="metrics">
+      <div class="metric"><div class="label">기준일</div><div class="value" id="mDate"></div></div>
+      <div class="metric"><div class="label">편입</div><div class="value" id="mIn"></div></div>
+      <div class="metric"><div class="label">편출</div><div class="value" id="mOut"></div></div>
+      <div class="metric"><div class="label">수집일수</div><div class="value" id="mDays"></div></div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">구성종목 TOP 10 (기준일 <span id="top10DateLabel"></span>)</h2>
+        <select id="top10DateSelect" style="font-size:13px; padding:5px 8px; border-radius:8px; border:0.5px solid var(--border); background:var(--card); color:var(--text);"></select>
+      </div>
+      <table>
+        <thead><tr><th>순위</th><th>종목명</th><th style="text-align:right">비중</th><th style="text-align:right">전일대비</th></tr></thead>
+        <tbody id="top10Body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+        <h2 style="margin:0;">TOP10 편출입 히스토리 (최신순)</h2>
+        <div style="display:flex; gap:12px; font-size:11px; color:var(--text-secondary);">
+          <span style="display:flex; align-items:center; gap:4px;"><span class="sw" style="background:var(--up);"></span>편입</span>
+          <span style="display:flex; align-items:center; gap:4px;"><span class="sw" style="background:var(--down);"></span>편출</span>
+        </div>
+      </div>
+      <div id="historyBody"></div>
+      <div id="histMoreWrap"></div>
+    </div>
+
+    <div class="card">
+      <h2>누적 편입 · 편출 전체보기</h2>
+      <p class="muted" style="margin:-8px 0 14px;">쌩 신규 편입 = 전체 기간 중 TOP10에 처음 들어온 종목 (재편입 제외) · 전체 편출 = 전체 기간의 편출 이력 전부</p>
+      <div class="summary-grid">
+        <div>
+          <h3 id="brandNewTitle"></h3>
+          <div class="scroll-list" id="brandNewList"></div>
+        </div>
+        <div>
+          <h3 id="allExitsTitle"></h3>
+          <div class="scroll-list" id="allExitsList"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">시점별 TOP10 종목 비중 추이</h2>
+        <div class="view-toggle" id="viewToggle">
+          <button type="button" data-view="daily" class="active">일간</button>
+          <button type="button" data-view="weekly">주간</button>
+          <button type="button" data-view="monthly">월간</button>
+        </div>
+      </div>
+      <p class="muted" style="margin:2px 0 14px;">각 날짜에 실제로 TOP10에 있었던 구간만 표시 (TOP10에서 빠지면 선이 끊김) · 일간=최근 20영업일, 주간=매주 첫 영업일, 월간=매월 첫 영업일</p>
+      <div class="legend" id="trendLegend"></div>
+      <div style="position:relative; height:340px;">
+        <canvas id="trendChart" role="img" aria-label="선택한 기간 단위로 실제 TOP10에 포함되었던 구간만 표시한 종목 비중 추이 선 그래프"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <footer>KRX 공시 PDF 기준 자동 생성 · pykrx · {generated} KST</footer>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>{js}</script>
+</body>
+</html>
+"""
+
+
+def main() -> int:
+    payloads, bases = {}, {}
+    for etf in ETFS:
+        records, basis = load_records(etf["ticker"])
+        payloads[etf["ticker"]] = build_payload(records)
+        bases[etf["ticker"]] = basis
+
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    (DOCS_DIR / "index.html").write_text(render(payloads, bases), encoding="utf-8")
+    (DOCS_DIR / ".nojekyll").write_text("", encoding="utf-8")
+
+    print(f"[렌더 완료] {DOCS_DIR / 'index.html'}")
+    for etf in ETFS:
+        p = payloads[etf["ticker"]]
+        if not p:
+            print(f"  - {etf['name']}: 데이터 없음")
+        else:
+            print(f"  - {etf['name']}: 기준일 {p['latest_date']} · "
+                  f"수집 {len(p['dates'])}일 · 편입 {len(p['entries'])} / 편출 {len(p['exits'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+"""대시보드 공통 설정."""
+
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
+DOCS_DIR = ROOT / "docs"
+
+# 추적 대상 ETF. 순서가 대시보드 탭 순서가 된다.
+ETFS = [
+    {"ticker": "456600", "name": "TIMEFOLIO 글로벌AI인공지능액티브", "short": "TIMEFOLIO AI"},
+    {"ticker": "471040", "name": "KoAct 글로벌AI&로봇액티브", "short": "KoAct AI·로봇"},
+    {"ticker": "466950", "name": "TIGER 글로벌AI액티브", "short": "TIGER AI"},
+]
+
+# 대시보드에 노출할 상위 종목 수
+TOP_N = 10
+
+# 스파크라인에 사용할 최근 영업일 수
+SPARK_DAYS = 20
+
+# CSV 컬럼 (pykrx get_etf_portfolio_deposit_file 기준)
+PDF_COLUMNS = ["티커", "구성종목명", "계약수", "금액", "시가총액", "비중"]
+
+"""ETF 구성종목(PDF, Portfolio Deposit File)을 매일 수집해 data/ 에 누적 저장한다.
+
+사용법
+------
+    python scripts/collect.py                 # 오늘(KST) 기준 수집
+    python scripts/collect.py --date 20260817 # 특정일 수집
+    python scripts/collect.py --backfill 30   # 과거 30 영업일 소급 수집 시도
+
+과거 소급(backfill)이 되는지는 KRX가 응답을 주느냐에 달려 있다.
+처음 한 번 --backfill 을 돌려보고, 데이터가 쌓이면 그날부터 비교가 가능하다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+from pykrx import stock
+
+from config import DATA_DIR, ETFS, PDF_COLUMNS
+
+KST = ZoneInfo("Asia/Seoul")
+
+
+def today_kst() -> str:
+    return datetime.now(KST).strftime("%Y%m%d")
+
+
+def now_kst_iso() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+
+
+def business_days_back(end: str, count: int) -> list[str]:
+    """end 로부터 과거로 거슬러 올라가며 주말을 제외한 날짜 문자열 목록을 만든다.
+
+    공휴일은 걸러내지 못하지만, 휴장일은 KRX가 빈 응답을 주므로 수집 단계에서
+    자연히 걸러진다.
+    """
+    days: list[str] = []
+    cursor = datetime.strptime(end, "%Y%m%d")
+    while len(days) < count:
+        if cursor.weekday() < 5:  # 0=월 ... 4=금
+            days.append(cursor.strftime("%Y%m%d"))
+        cursor -= timedelta(days=1)
+    return days
+
+
+def fetch_pdf(date: str, ticker: str) -> pd.DataFrame | None:
+    """특정일·특정 ETF의 구성종목을 조회한다. 실패하거나 비면 None."""
+    try:
+        df = stock.get_etf_portfolio_deposit_file(date, ticker)
+    except Exception as exc:  # 네트워크·파싱 오류 모두 여기로
+        print(f"    [!] {ticker} {date} 조회 실패: {type(exc).__name__}: {exc}")
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    df = df.reset_index()
+    for col in PDF_COLUMNS:
+        if col not in df.columns:
+            print(f"    [!] {ticker} {date} 예상 컬럼 없음: {col}")
+            return None
+    return df[PDF_COLUMNS]
+
+
+def fetch_quote(date: str, ticker: str) -> dict:
+    """ETF 자체의 종가·NAV. 실패해도 대시보드는 동작해야 하므로 조용히 넘어간다."""
+    try:
+        df = stock.get_etf_ohlcv_by_date(date, date, ticker)
+        if df is None or df.empty:
+            return {}
+        row = df.iloc[-1]
+        return {
+            "종가": float(row.get("종가", 0) or 0),
+            "NAV": float(row.get("NAV", 0) or 0),
+            "거래량": float(row.get("거래량", 0) or 0),
+        }
+    except Exception:
+        return {}
+
+
+def save(ticker: str, date: str, df: pd.DataFrame, quote: dict) -> None:
+    out_dir = DATA_DIR / ticker
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    df.to_csv(out_dir / f"{date}.csv", index=False, encoding="utf-8-sig")
+
+    if quote:
+        quote_path = out_dir / "quotes.json"
+        quotes = {}
+        if quote_path.exists():
+            quotes = json.loads(quote_path.read_text(encoding="utf-8"))
+        quotes[date] = quote
+        quote_path.write_text(
+            json.dumps(quotes, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+
+
+def collect_one_day(date: str, force: bool = False) -> int:
+    """하루치를 수집한다. 저장에 성공한 ETF 개수를 반환."""
+    saved = 0
+    for etf in ETFS:
+        ticker, name = etf["ticker"], etf["name"]
+        target = DATA_DIR / ticker / f"{date}.csv"
+        if target.exists() and not force:
+            print(f"    - {name} ({ticker}) {date}: 이미 있음, 건너뜀")
+            saved += 1
+            continue
+
+        df = fetch_pdf(date, ticker)
+        if df is None:
+            print(f"    - {name} ({ticker}) {date}: 데이터 없음 (휴장일이거나 미제공)")
+            continue
+
+        save(ticker, date, df, fetch_quote(date, ticker))
+        print(f"    - {name} ({ticker}) {date}: {len(df)}종목 저장")
+        saved += 1
+        time.sleep(0.6)  # KRX 서버 배려
+    return saved
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", help="수집 기준일 YYYYMMDD (기본: 오늘 KST)")
+    parser.add_argument(
+        "--backfill", type=int, default=0, help="과거 N 영업일까지 소급 수집 시도"
+    )
+    parser.add_argument("--force", action="store_true", help="이미 있는 날도 다시 받기")
+    args = parser.parse_args()
+
+    end = args.date or today_kst()
+    print(f"[수집 시작] 기준일 {end} / 현재 {now_kst_iso()}")
+
+    if args.backfill > 0:
+        dates = business_days_back(end, args.backfill)
+        print(f"  소급 수집: {dates[-1]} ~ {dates[0]} ({len(dates)}일)")
+    else:
+        dates = [end]
+
+    total = 0
+    for date in dates:
+        print(f"  · {date}")
+        total += collect_one_day(date, force=args.force)
+
+    print(f"[수집 완료] 저장/확인된 (ETF×일자) 건수: {total}")
+
+    if total == 0:
+        print(
+            "\n수집된 데이터가 하나도 없습니다.\n"
+            "  - 오늘이 휴장일이면 정상입니다.\n"
+            "  - 그게 아니라면 KRX 접근이 막혔을 수 있습니다. "
+            "저장소 Secrets 에 KRX_ID / KRX_PW 를 넣어보세요."
+        )
+        # 휴장일에 워크플로가 빨갛게 실패하지 않도록 0으로 끝낸다.
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+"""수집된 CSV를 대시보드용 payload 로 가공한다.
+
+집계 로직(TOP10, 편출입 히스토리, 쌩 신규 편입, 멤버십 기반 추이)은
+사용자가 이미 쓰던 build_dashboard.py 의 구조를 그대로 따랐다.
+입력만 엑셀 Raw 시트에서 pykrx CSV 로 바뀌었다.
+"""
+
+from __future__ import annotations
+
+import collections
+import datetime
+
+import pandas as pd
+
+from config import DATA_DIR
+
+TOP_N = 10
+DAILY_WINDOW = 20
+
+
+def _iso(yyyymmdd: str) -> str:
+    return f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:]}"
+
+
+def _resolve_weight(df: pd.DataFrame) -> tuple[pd.Series, str]:
+    """비중을 확정한다.
+
+    해외 자산 편입 ETF는 KRX가 '비중'을 0으로 내려주는 경우가 있어
+    비중 → 금액 → 시가총액 순으로 대체 계산하고 그 근거를 함께 돌려준다.
+    """
+    for col, label in (
+        ("비중", "KRX 제공 비중"),
+        ("금액", "평가금액 환산"),
+        ("시가총액", "시가총액 환산"),
+    ):
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+        total = s.sum()
+        if total > 0:
+            return (s if col == "비중" else s / total * 100.0), label
+    return pd.Series([0.0] * len(df), index=df.index), "산출 불가"
+
+
+def load_records(ticker: str) -> tuple[list[dict], str]:
+    """data/<ticker>/*.csv 전체를 레코드 목록으로 읽는다."""
+    d = DATA_DIR / ticker
+    if not d.exists():
+        return [], ""
+
+    records: list[dict] = []
+    basis = ""
+    for path in sorted(d.glob("*.csv")):
+        date = _iso(path.stem)
+        df = pd.read_csv(path, dtype={"티커": str})
+        if df.empty:
+            continue
+        df["티커"] = df["티커"].fillna("").astype(str).str.strip()
+        df["구성종목명"] = df["구성종목명"].fillna("").astype(str).str.strip()
+
+        weights, basis = _resolve_weight(df)
+        for (_, row), w in zip(df.iterrows(), weights):
+            name = row["구성종목명"]
+            code = row["티커"] or ("CASH" if name in ("원화예금", "현금") else name)
+            records.append(
+                {"date": date, "code": code, "name": name, "weight": float(w)}
+            )
+    return records, basis
+
+
+def compute_trend_view(view_dates, top10_by_date, code_to_name) -> dict:
+    """멤버십 기반 추이: 그 날짜의 TOP10에 실제로 있었던 구간만 값을 채운다."""
+    member_codes, seen = [], set()
+    for d in view_dates:
+        for r in top10_by_date[d]:
+            if r["code"] not in seen:
+                seen.add(r["code"])
+                member_codes.append(r["code"])
+
+    series = {}
+    for code in member_codes:
+        vals = []
+        for d in view_dates:
+            m = next((x for x in top10_by_date[d] if x["code"] == code), None)
+            vals.append(round(m["weight"], 2) if m else None)
+        series[code_to_name.get(code, code)] = vals
+    return {"dates": view_dates, "series": series}
+
+
+def build_payload(records: list[dict]) -> dict | None:
+    if not records:
+        return None
+
+    by_date = collections.defaultdict(list)
+    for r in records:
+        by_date[r["date"]].append(r)
+    dates = sorted(by_date.keys())
+
+    def top10(d):
+        return sorted(by_date[d], key=lambda r: -r["weight"])[:TOP_N]
+
+    latest = dates[-1]
+    prev = dates[-2] if len(dates) >= 2 else None
+
+    latest_top10 = top10(latest)
+    prev_top10 = top10(prev) if prev else []
+    prev_codes = {r["code"] for r in prev_top10}
+    latest_codes = {r["code"] for r in latest_top10}
+    prev_weight_map = {r["code"]: r["weight"] for r in by_date[prev]} if prev else {}
+
+    # 날짜 드롭다운용: 모든 날짜의 TOP10을 미리 계산해 둔다
+    all_top10 = {}
+    for i, d in enumerate(dates):
+        d_prev = {r["code"]: r["weight"] for r in by_date[dates[i - 1]]} if i > 0 else {}
+        rows = []
+        for rank, r in enumerate(top10(d), 1):
+            pw = d_prev.get(r["code"])
+            rows.append({
+                "rank": rank, "code": r["code"], "name": r["name"],
+                "weight": round(r["weight"], 2),
+                "chg_bp": None if pw is None else round((r["weight"] - pw) * 100, 1),
+                "is_new": i > 0 and pw is None,
+            })
+        all_top10[d] = rows
+
+    entries = [r for r in latest_top10 if prev and r["code"] not in prev_codes]
+    exits = [r for r in prev_top10 if r["code"] not in latest_codes]
+
+    # 날짜별 편출입 히스토리
+    history = []
+    for i in range(1, len(dates)):
+        pd_, cd = dates[i - 1], dates[i]
+        pt, ct = top10(pd_), top10(cd)
+        pcodes, ccodes = {r["code"] for r in pt}, {r["code"] for r in ct}
+        ent = [{"code": r["code"], "name": r["name"], "weight": round(r["weight"], 2)}
+               for r in ct if r["code"] not in pcodes]
+        ext = [{"code": r["code"], "name": r["name"], "weight": round(r["weight"], 2)}
+               for r in pt if r["code"] not in ccodes]
+        if ent or ext:
+            history.append({"date": cd, "prev_date": pd_, "entries": ent, "exits": ext})
+    history.sort(key=lambda h: h["date"], reverse=True)
+
+    # 쌩 신규 편입: 추적 기간 중 TOP10에 처음 들어온 종목.
+    # 첫날부터 있던 종목은 그 이전 이력을 모르므로 제외한다.
+    baseline = {r["code"] for r in top10(dates[0])}
+    first_seen = {}
+    for d in dates:
+        for r in top10(d):
+            first_seen.setdefault(r["code"], {
+                "date": d, "code": r["code"], "name": r["name"],
+                "weight": round(r["weight"], 2),
+            })
+    brand_new = [v for c, v in first_seen.items() if c not in baseline]
+    brand_new.sort(key=lambda x: x["date"], reverse=True)
+
+    all_exits_flat = [
+        {"date": h["date"], "prev_date": h["prev_date"], "code": ex["code"],
+         "name": ex["name"], "weight": ex["weight"]}
+        for h in history for ex in h["exits"]
+    ]
+
+    top10_by_date = {d: top10(d) for d in dates}
+    code_to_name = {}
+    for d in dates:
+        for r in by_date[d]:
+            code_to_name[r["code"]] = r["name"]
+
+    # 일간/주간/월간 토글 사이에서 종목 색이 흔들리지 않도록 전역 등장 순서를 고정
+    order, seen_all = [], set()
+    for d in dates:
+        for r in top10_by_date[d]:
+            if r["code"] not in seen_all:
+                seen_all.add(r["code"])
+                order.append(r["code"])
+
+    daily_dates = dates[-DAILY_WINDOW:] if len(dates) > DAILY_WINDOW else dates[:]
+
+    weekly, monthly = {}, {}
+    for d in dates:
+        dt = datetime.date.fromisoformat(d)
+        wk = (dt.isocalendar()[0], dt.isocalendar()[1])
+        if wk not in weekly or d < weekly[wk]:
+            weekly[wk] = d
+        mk = (dt.year, dt.month)
+        if mk not in monthly or d < monthly[mk]:
+            monthly[mk] = d
+
+    return {
+        "latest_date": latest,
+        "prev_date": prev,
+        "dates": dates,
+        "top10": all_top10[latest],
+        "entries": [{"code": r["code"], "name": r["name"], "weight": round(r["weight"], 2)} for r in entries],
+        "exits": [{"code": r["code"], "name": r["name"], "weight": round(r["weight"], 2)} for r in exits],
+        "history": history,
+        "all_top10": all_top10,
+        "trend_views": {
+            "daily": compute_trend_view(daily_dates, top10_by_date, code_to_name),
+            "weekly": compute_trend_view(sorted(weekly.values()), top10_by_date, code_to_name),
+            "monthly": compute_trend_view(sorted(monthly.values()), top10_by_date, code_to_name),
+        },
+        "name_order": [code_to_name.get(c, c) for c in order],
+        "brand_new_entries": brand_new,
+        "all_exits_flat": all_exits_flat,
+    }
+
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+
+# 글로벌 AI ETF 구성종목 대시보드
+
+pykrx로 매일 아침 ETF 3종의 구성종목(PDF, Portfolio Deposit File)을 수집해
+**전일 대비 편입·편출·비중 증감**을 보여주는 정적 대시보드입니다.
+PC를 켜둘 필요 없이 GitHub Actions가 대신 돌립니다.
+
+| 코드 | ETF |
+|---|---|
+| 456600 | TIMEFOLIO 글로벌AI인공지능액티브 |
+| 471040 | KoAct 글로벌AI&로봇액티브 |
+| 466950 | TIGER 글로벌AI액티브 |
+
+## 구조
+
+```
+scripts/collect.py   KRX에서 구성종목을 받아 data/ 에 CSV로 누적
+scripts/payload.py   TOP10·편출입 히스토리·추이 집계
+scripts/render.py    docs/index.html 생성
+scripts/make_mock.py 가짜 데이터 생성 (화면 확인용)
+.github/workflows/daily.yml  매일 07:00 KST 자동 실행
+data/                날짜별 CSV가 쌓이는 곳 = 이력 그 자체
+docs/index.html      대시보드 (GitHub Pages가 이 파일을 서빙)
+```
+
+화면 구성은 기존에 쓰던 `top10_dashboard.html` 형식을 그대로 따랐습니다.
+상단 메트릭 4종(기준일·편입·편출·수집일수), 날짜 드롭다운이 달린 TOP10 표,
+편출입 히스토리, 누적 편입·편출 전체보기, 일간/주간/월간 추이 차트가 동일하며
+**맨 위에 ETF 3종을 전환하는 탭만 추가**했습니다.
+
+## 설치 (처음 한 번)
+
+### 1. 저장소 만들기
+
+GitHub에서 새 저장소를 만듭니다. **Public** 으로 만드세요 —
+Actions와 Pages를 무료로 쓰려면 공개 저장소여야 합니다.
+이 폴더의 파일 전부를 그 저장소에 올립니다.
+
+### 2. Actions에 쓰기 권한 주기
+
+`Settings → Actions → General → Workflow permissions`
+→ **Read and write permissions** 선택 → Save
+
+이게 없으면 수집한 데이터를 저장소에 커밋하지 못하고 실패합니다.
+
+### 3. Pages 켜기
+
+`Settings → Pages`
+→ Source: **Deploy from a branch**
+→ Branch: **main** / 폴더: **/docs** → Save
+
+몇 분 뒤 아래 주소가 열립니다.
+
+```
+https://coblin523523-coder.github.io/<저장소이름>/
+```
+
+### 4. (선택) KRX 계정 등록
+
+KRX가 비로그인 조회를 막을 경우를 대비한 보험입니다.
+
+`Settings → Secrets and variables → Actions → New repository secret`
+→ `KRX_ID` / `KRX_PW` 두 개 등록
+
+한 번 넣으면 다시 볼 수 없고, 로그에도 `***` 로 가려집니다.
+
+### 5. 첫 실행
+
+`Actions` 탭 → `일별 ETF 구성종목 수집` → **Run workflow**
+→ backfill 값을 `30` 쯤으로 넣고 실행
+
+**이 첫 실행이 가장 중요한 검증입니다.** 로그를 보면 세 가지 중 하나가 나옵니다.
+
+- 과거 날짜까지 `N종목 저장` 이 찍힌다 → KRX가 소급 조회를 허용. 바로 이력이 생깁니다.
+- 최근 하루이틀만 저장된다 → 소급은 불가. **오늘부터 하루씩 쌓입니다.** 내일부터 비교가 나옵니다.
+- 전부 `조회 실패` → KRX가 GitHub 서버 IP를 막은 것. 4번의 KRX 계정을 등록하고 재시도하세요.
+
+## 로컬에서 화면만 미리 보기
+
+```bash
+pip install -r requirements.txt
+python scripts/make_mock.py    # 가짜 데이터 생성
+python scripts/render.py       # docs/index.html 생성
+```
+
+실제 수집을 시작하기 전에 `data/` 안의 가짜 데이터는 지우세요.
+
+## 실행 시각 바꾸기
+
+`.github/workflows/daily.yml` 의 cron은 **UTC** 기준입니다.
+
+```yaml
+- cron: "0 22 * * 0-4"   # 22:00 UTC = 다음날 07:00 KST, 월~금
+```
+
+KST 시각에서 9시간을 빼면 UTC입니다. 9시간을 빼서 날짜가 하루 넘어가면
+요일 필드도 함께 하루 당겨야 합니다.
+
+## 알아둘 점
+
+- **비중이 0으로 내려올 수 있습니다.** 해외 자산 편입 ETF는 KRX가 비중을 0으로 주는
+  경우가 있어, 그때는 평가금액으로 비중을 환산하고 대시보드 상단에 그 사실을 표시합니다.
+- **휴장일에는 아무것도 저장되지 않습니다.** 워크플로는 실패가 아니라 정상 종료합니다.
+- **Actions cron은 60일간 저장소 활동이 없으면 자동 정지됩니다.** 다만 이 워크플로는
+  매일 커밋을 하므로 스스로 활동을 만들어 사실상 문제되지 않습니다.
+- 매일 `--backfill 5` 로 돌기 때문에 며칠 실패해도 다음 성공 실행에서 자동으로 메꿉니다.
+
+## 면책
+
+KRX 공시 자료를 가공한 정보 제공용 페이지입니다. 투자 판단의 근거로 삼기 전에
+반드시 운용사 원 공시를 확인하세요.
+
+pykrx>=1.2.8
+pandas>=2.0
+numpy>=1.24
